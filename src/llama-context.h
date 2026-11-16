@@ -648,6 +648,8 @@ private:
     bool sched_need_reserve = true;
     // fork: limit only the reserved graph, not the caller's physical batch size.
     uint32_t sched_reserve_tokens = 0;
+    // true while prompt_buffers_resize can retry a failed reserve with fewer rows
+    bool sched_reserve_retry = false;
     // The scheduler owns expert residency independently of its compute allocator.
     // Reuse it for graph-shape changes while its fixed capacity/configuration fits.
     size_t sched_node_capacity = 0;

@@ -2814,6 +2814,12 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
             trim += need > free ? need - free : 0;
         }
         if (trim > 0) {
+            // Several devices: a loan from the expert cache retires the device tables, and the prompt then
+            // reads every expert from host memory. Smaller prompt chunks that fit without a loan are faster;
+            // prompt_buffers_resize retries with half the rows.
+            if (sched_reserve_retry && model.n_devices() > 1 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && n_tokens > 1024) {
+                throw std::runtime_error("turn scratch does not fit beside the expert cache");
+            }
             b1_cache_needs_refresh = true;
             const size_t released = ggml_backend_sched_moe_cache_trim(sched.get(), trim);
             LLAMA_LOG_INFO("%s: turn scratch borrowed %.2f MiB (requested %.2f MiB)\n", __func__, released / 1048576.0, trim / 1048576.0);
@@ -6076,6 +6082,11 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     const bool suspend_prompt_cache = b1 && alone && n_tokens >= 16384 &&
         (b1_ffn_scratch_active || b1_layer_scratch_active) && suspend_early && suspend_early[0] == '1' &&
         suspend_cache && suspend_cache[0] == '1';
+    struct reserve_retry_guard {
+        bool & active;
+        ~reserve_retry_guard() { active = false; }
+    } reserve_retry_guard_ { sched_reserve_retry };
+    sched_reserve_retry = true;
     for (;;) {
         sched_reserve_tokens = rows;
         sched_need_reserve = true;
