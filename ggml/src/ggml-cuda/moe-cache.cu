@@ -1114,6 +1114,8 @@ struct moe_cache_device_table {
     std::vector<const void *> copy_source;
     // fork CACHEHIT: 1 where the expert lives in permanent residency (never swapped).
     std::vector<uint8_t> permanent;
+    // 1 where addresses[e] is a copy on the owner device (pool slot or permanent residency), not a host alias.
+    std::vector<uint8_t> resident;
     // 1 where the expert belongs to the always-resident bank: its entry points at a shared zero block
     // (the regular call gives it weight 0) and it is marked permanent, so no miss, swap or CPU split touches it.
     std::vector<uint8_t> bank;
@@ -9466,6 +9468,9 @@ void ggml_cuda_moe_cache_table_graph_end(ggml_backend_cuda_context & ctx) {
 #endif
 }
 
+// outcomes of moe_cache_device_copy: done, tables not ready, no table, other device or shape, expert not resident
+static std::atomic<uint64_t> g_moe_device_copy_stats[5];
+
 static void moe_cache_device_release(moe_cache_session & session, bool retain_sources) {
     if (session.mass_trace) {
         ggml_cuda_set_device(session.devices[0]->logical);
@@ -9484,6 +9489,12 @@ static void moe_cache_device_release(moe_cache_session & session, bool retain_so
         session.mass_trace_counts = nullptr;
     }
     moe_pf_release(&session); // fork PREFETCHFIX: tables below are about to be freed
+    if (session.devices.size() > 1 && session.device_ready.load()) {
+        MOE_CACHE_LOG("[moe-cache] device copies for prompt graphs (process total): done=%llu not-ready=%llu no-table=%llu other-device=%llu not-resident=%llu\n",
+                (unsigned long long) g_moe_device_copy_stats[0].load(), (unsigned long long) g_moe_device_copy_stats[1].load(),
+                (unsigned long long) g_moe_device_copy_stats[2].load(), (unsigned long long) g_moe_device_copy_stats[3].load(),
+                (unsigned long long) g_moe_device_copy_stats[4].load());
+    }
     session.device_ready.store(false);
     ggml_moe_bank_onepath_set_live(false);
     if (session.device_adapt_stream) {
@@ -9631,6 +9642,57 @@ static int moe_cache_decode_capacity(void * opaque, int64_t n_expert_used, const
         capacity = std::min(capacity, get_mmvq_mmid_max_batch((ggml_type) types[i], cc));
     }
     return capacity;
+}
+
+// Layer split only: a prompt graph gets its experts from the owner's resident copies, not from host memory.
+static int moe_cache_device_copy(void * opaque, void * backend, ggml_tensor * dst, const void * host_base,
+        const uint8_t * used, int64_t n_expert, size_t dst_stride) {
+    auto * session = (moe_cache_session *) opaque;
+    auto * b = (ggml_backend_t) backend;
+    if (!session || !b || !ggml_backend_is_cuda(b) || !dst || !dst->data || !host_base || !used ||
+            session->devices.size() < 2) {
+        return 0;
+    }
+    auto * ctx = (ggml_backend_cuda_context *) b->context;
+    std::lock_guard<std::mutex> lock(session->mu);
+    if (!session->device_ready.load()) {
+        g_moe_device_copy_stats[1]++;
+        return 0;
+    }
+    const auto found = session->device_tables.find(host_base);
+    if (found == session->device_tables.end()) {
+        g_moe_device_copy_stats[2]++;
+        return 0;
+    }
+    const auto & table = found->second;
+    const size_t expert_bytes = table.desc.expert_size;
+    if (!table.owner || table.owner->logical != ctx->device || table.desc.n_expert != n_expert ||
+            table.resident.size() != (size_t) n_expert || dst_stride < expert_bytes ||
+            (size_t) (n_expert - 1) * dst_stride + expert_bytes > ggml_nbytes(dst)) {
+        g_moe_device_copy_stats[3]++;
+        return 0;
+    }
+    for (int64_t e = 0; e < n_expert; ++e) {
+        if (used[e] && !table.resident[e]) {
+            g_moe_device_copy_stats[4]++;
+            return 0;
+        }
+    }
+    g_moe_device_copy_stats[0]++;
+    ggml_cuda_set_device(ctx->device);
+    cudaStream_t stream = ctx->stream();
+    for (int64_t e = 0; e < n_expert; ++e) {
+        if (!used[e]) {
+            continue;
+        }
+        char * target = (char *) dst->data + (size_t) e * dst_stride;
+        CUDA_CHECK(cudaMemcpyAsync(target, table.addresses[e], expert_bytes, cudaMemcpyDeviceToDevice, stream));
+        // same zero bytes after an expert as the host upload writes
+        if (e + 1 < n_expert && !used[e + 1]) {
+            CUDA_CHECK(cudaMemsetAsync(target + dst_stride, 0, std::min(expert_bytes, (size_t) 512), stream));
+        }
+    }
+    return 1;
 }
 
 static int moe_cache_device_supports(void * opaque, void * backend, const ggml_tensor * op) {
@@ -13806,6 +13868,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             (void)cudaGetLastError();
             table.addresses.resize(d.n_expert);
             table.permanent.assign(d.n_expert, 0);
+            table.resident.assign(d.n_expert, 0);
             table.bank.assign(d.n_expert, 0);
             table.fallback.resize(d.n_expert);
             table.copy_source.resize(d.n_expert);
@@ -13863,6 +13926,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                             (begin + expert_bytes + page - 1) & ~(page - 1), nullptr, nullptr, false});
                 }
                 table.addresses[e] = address;
+                table.resident[e] = address != nullptr;
             }
             table_bytes[owner_index] += (size_t) d.n_expert * (sizeof(void *) * (session->prefetch_enabled ? 2 : 1) + sizeof(unsigned long long) + (resident_mask ? sizeof(uint8_t) : 0));
             if (!moe_cache_table_bytes_add(arena_bytes[owner_index], (size_t)d.n_expert * sizeof(void *)) ||
@@ -14431,6 +14495,7 @@ static void moe_cache_register(const void * owner) {
     api.resident = moe_cache_resident;
     api.set_skip_tail = moe_cache_set_skip_tail;
     api.set_layer_device = moe_cache_set_layer_device;
+    api.device_copy = moe_cache_device_copy;
     ggml_moe_cache_register(&api);
 }
 

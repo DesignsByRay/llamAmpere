@@ -3926,6 +3926,15 @@ int ggml_backend_sched_moe_cache_device_prepare(ggml_backend_sched_t sched,
     return sched->moe_cache_api.device_prepare(sched->moe_cache_session, tensors, n_tensors);
 }
 
+int ggml_backend_sched_moe_cache_device_copy(ggml_backend_sched_t sched, ggml_backend_t backend,
+        struct ggml_tensor * dst, const void * host_base, const uint8_t * used, int64_t n_expert, size_t dst_stride) {
+    if (!sched || !sched->moe_cache_session || !sched->moe_cache_api.device_copy || !backend || !dst || !host_base ||
+            !used || n_expert <= 0) {
+        return 0;
+    }
+    return sched->moe_cache_api.device_copy(sched->moe_cache_session, backend, dst, host_base, used, n_expert, dst_stride);
+}
+
 int ggml_backend_sched_moe_cache_decode_capacity(ggml_backend_sched_t sched, int64_t n_expert_used,
         const int32_t * types, int n_types) {
     if (!sched || !sched->moe_cache_session || !sched->moe_cache_api.decode_capacity || n_expert_used <= 0 ||
