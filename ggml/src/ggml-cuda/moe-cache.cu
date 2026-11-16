@@ -1103,6 +1103,7 @@ struct moe_cache_device_table {
     std::string name;
     size_t host_stride = 0;
     const void * borrowed = nullptr; // model-owned registered arena; never unregistered here
+    moe_cache_device * owner = nullptr; // device that holds this table and runs its layer
     bool permanent_sources = false;
     const void ** device = nullptr;
     const void ** staging_device = nullptr;
@@ -3003,9 +3004,18 @@ static bool moe_cache_table_bytes_add(size_t & total, size_t bytes) {
     return true;
 }
 
+static bool moe_cache_session_has_logical(const moe_cache_session & session, int logical) {
+    for (const auto & device : session.devices) {
+        if (device->logical == logical) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool moe_cache_reserve_table_arena(moe_cache_session & session, moe_cache_device & device) {
     const char * enabled = getenv("GGML_MOE_CACHE_DEVICE");
-    if (!enabled || strcmp(enabled, "1") != 0 || session.devices.size() != 1) {
+    if (!enabled || strcmp(enabled, "1") != 0) {
         return true;
     }
     size_t required = 0, entries = 0, max_count = 0;
@@ -3793,7 +3803,7 @@ static void moe_cache_log_configuration(moe_cache_session & session) {
             session.config.queue_max, session.config.queue_mb, moe_cache_det() ? 1 : 0);
     const char * device_table = getenv("GGML_MOE_CACHE_DEVICE");
     if (session.devices.size() > 1 && device_table && strcmp(device_table, "1") == 0) {
-        MOE_CACHE_LOG("[moe-cache] device table unavailable with %zu physical GPUs; using fallback expert path (use --device CUDA0 for the device table)\n",
+        MOE_CACHE_LOG("[moe-cache] %zu physical GPUs: the device table needs a layer split; without one the fallback expert path is used (or use --device CUDA0)\n",
                 session.devices.size());
     }
 }
@@ -7865,7 +7875,7 @@ uint64_t ggml_cuda_moe_cache_device_capture_generation(int logical) {
     }
     const auto * session = g_session_stack.back().active;
     if (!session || !session->device_ready.load(std::memory_order_acquire) ||
-            session->devices.size() != 1 || session->devices[0]->logical != logical) {
+            !moe_cache_session_has_logical(*session, logical)) {
         return 0;
     }
     return session->device_capture_generation;
@@ -9500,9 +9510,11 @@ static void moe_cache_device_release(moe_cache_session & session, bool retain_so
         session.device_frozen = false;
         return;
     }
-    ggml_cuda_set_device(session.devices[0]->logical);
     // Tables can be in flight on a scheduler stream, not the legacy cache stream.
-    CUDA_CHECK(cudaDeviceSynchronize());
+    for (size_t i = session.devices.size(); i-- > 0;) {
+        ggml_cuda_set_device(session.devices[i]->logical);
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
     if (session.mj_retained_arena) {
         unsigned long long counts[7] = {};
         if (cudaMemcpy(counts, session.mj_retained_counts, sizeof(counts), cudaMemcpyDeviceToHost) == cudaSuccess) {
@@ -9566,8 +9578,7 @@ static void moe_cache_device_release(moe_cache_session & session, bool retain_so
 }
 
 static bool moe_cache_device_op_fits(const moe_cache_session & session, const ggml_tensor * op, int logical) {
-    if (!session.device_ready.load() || session.devices.size() != 1 ||
-            session.devices[0]->logical != logical || !op || op->op != GGML_OP_MUL_MAT_ID ||
+    if (!session.device_ready.load() || !op || op->op != GGML_OP_MUL_MAT_ID ||
             !op->src[0] || !op->src[1] || !op->src[2]) {
         return false;
     }
@@ -9575,7 +9586,7 @@ static bool moe_cache_device_op_fits(const moe_cache_session & session, const gg
     const ggml_tensor * a = op->src[1];
     const ggml_tensor * ids = op->src[2];
     const auto found = session.device_tables.find(w->data);
-    if (found == session.device_tables.end()) {
+    if (found == session.device_tables.end() || !found->second.owner || found->second.owner->logical != logical) {
         return false;
     }
     const auto & d = found->second.desc;
@@ -9601,14 +9612,18 @@ static int moe_cache_decode_capacity(void * opaque, int64_t n_expert_used, const
     const char * enabled = getenv("GGML_MOE_CACHE_DEVICE");
     // The first concurrent verify may exceed the eight-token prepare gate.
     // Bound it from model types first, leaving allocation at its safe decode boundary.
-    if (!session || !enabled || strcmp(enabled, "1") != 0 || session->devices.size() != 1 ||
+    if (!session || !enabled || strcmp(enabled, "1") != 0 || session->devices.empty() ||
+            (session->devices.size() > 1 && session->layer_owners.empty()) ||
             session->dormant || session->stopping || !types || n_types <= 0 ||
             n_expert_used <= 0 || n_expert_used > moe_cache_node_rows_max ||
             (session->device_attempted && !session->device_ready.load())) {
         return 0;
     }
     int capacity = std::min(session->config.max_batch, (int) (moe_cache_node_rows_max / n_expert_used));
-    const int cc = ggml_cuda_info().devices[session->devices[0]->logical].cc;
+    int cc = INT_MAX;
+    for (const auto & device : session->devices) {
+        cc = std::min(cc, ggml_cuda_info().devices[device->logical].cc);
+    }
     for (int i = 0; i < n_types; ++i) {
         if (!ggml_moe_cache_wtype_supported((ggml_type) types[i])) {
             return 0;
@@ -13578,10 +13593,15 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
     auto * session = (moe_cache_session *) opaque;
     const char * enabled = getenv("GGML_MOE_CACHE_DEVICE");
     if (!session || !enabled || strcmp(enabled, "1") != 0 || !tensors || n_tensors < 1 || n_tensors > 4096 ||
-            session->devices.size() != 1 || session->dormant || session->stopping) {
+            session->devices.empty() || session->dormant || session->stopping) {
         return 0;
     }
     std::unique_lock<std::mutex> lock(session->mu);
+    // Layer split: each device gets the tables of the layers it runs. Swap, miss staging and counters need one device.
+    const bool multi = session->devices.size() > 1;
+    if (multi && (session->layer_owners.empty() || session->prefetch_enabled)) {
+        return 0;
+    }
     if (session->device_ready.load()) {
         return 1;
     }
@@ -13603,7 +13623,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
     session->device_publish_async = moe_cache_env_i64("GGML_MOE_CACHE_DEVICE_PUBLISH_ASYNC", 0, 1, adaptation_value) && adaptation_value;
     // fork CACHEHIT: decayed-score swap policy with no host stall. Default off.
     // With prefetch on, swaps also rewrite the staging tables and never touch staging slots.
-    session->swap_enabled = moe_cache_env_i64("GGML_MOE_CACHE_SWAP", 0, 1, adaptation_value) && adaptation_value;
+    session->swap_enabled = !multi && moe_cache_env_i64("GGML_MOE_CACHE_SWAP", 0, 1, adaptation_value) && adaptation_value;
     if (session->swap_enabled) {
         if (moe_cache_env_i64("GGML_MOE_CACHE_SWAP_INTERVAL", 1, 1024, adaptation_value)) { session->swap_interval = (int)adaptation_value; }
         if (moe_cache_env_i64("GGML_MOE_CACHE_SWAP_MAX", 1, 4096, adaptation_value)) { session->swap_max = (int)adaptation_value; }
@@ -13627,12 +13647,19 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
     MOE_CACHE_LOG("[moe-cache] device adaptation policy: interval_scopes=%llu cap_bytes=%zu; recent-generation-counts only\n",
             (unsigned long long) session->device_adapt_interval, session->device_adapt_copy_cap);
     auto & device = *session->devices[0];
-    if (device.dead.load()) {
-        return 0;
+    for (const auto & d : session->devices) {
+        if (d->dead.load()) {
+            return 0;
+        }
     }
     // Freeze only after the worker has drained all queued prompt fills.
-    const bool idle = session->idle_cv.wait_for(lock, std::chrono::seconds(30), [&] {
-        return device.queue.empty() && !device.inflight;
+    const bool idle = session->idle_cv.wait_for(lock, std::chrono::seconds(multi ? 180 : 30), [&] {
+        for (const auto & d : session->devices) {
+            if (!d->queue.empty() || d->inflight) {
+                return false;
+            }
+        }
+        return true;
     });
     if (!idle) {
         MOE_CACHE_LOG("[moe-cache] device tables skipped: fill queue did not drain\n");
@@ -13650,6 +13677,33 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
     auto fail = [&]() {
         moe_cache_device_release(*session);
         MOE_CACHE_LOG("[moe-cache] device tables unavailable; continuing legacy exact CPU/cache mode\n");
+        return 0;
+    };
+    auto owner_of = [&](const ggml_moe_cache_tensor_desc & d) -> moe_cache_device * {
+        if (!multi) {
+            return &device;
+        }
+        int layer = -1;
+        if (!d.name || !moe_cache_layer_number(d.name, layer)) {
+            return nullptr;
+        }
+        const auto found = session->layer_owners.find(layer);
+        if (found == session->layer_owners.end()) {
+            return nullptr;
+        }
+        for (const auto & candidate : session->devices) {
+            if (candidate->physical == found->second) {
+                return candidate.get();
+            }
+        }
+        return nullptr;
+    };
+    auto device_index = [&](const moe_cache_device * d) -> size_t {
+        for (size_t i = 0; i < session->devices.size(); ++i) {
+            if (session->devices[i].get() == d) {
+                return i;
+            }
+        }
         return 0;
     };
     try {
@@ -13683,17 +13737,23 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         moe_cache_mapping_index mappings(session->mapped_ranges);
         std::vector<moe_cache_mapped_range> pending_ranges;
         const char * stats_env = getenv("GGML_MOE_CACHE_DEVICE_STATS");
-        const bool route_stats = stats_env && strcmp(stats_env, "1") == 0;
-        const bool resident_mask = moe_cache_table_mask_enabled();
+        const bool route_stats = !multi && stats_env && strcmp(stats_env, "1") == 0;
+        const bool resident_mask = !multi && moe_cache_table_mask_enabled();
         const bool mask_only = resident_mask && !route_stats;
-        size_t table_bytes = route_stats ? 3 * sizeof(unsigned long long) : 0, hot_bytes = 0;
-        size_t count_entries = 0, arena_bytes = 0;
+        const size_t n_devices = session->devices.size();
+        std::vector<size_t> table_bytes(n_devices, route_stats ? 3 * sizeof(unsigned long long) : 0);
+        std::vector<size_t> arena_bytes(n_devices, 0);
+        size_t hot_bytes = 0, count_entries = 0;
         size_t bank_zero_bytes = 0, bank_entries = 0;
         for (int i = 0; i < n_tensors; ++i) {
             const auto & d = tensors[i];
             if (d.data && ggml_moe_bank_lookup(d.data) && d.n_in > 0 && d.n_out > 0) {
                 bank_zero_bytes = std::max(bank_zero_bytes, ggml_row_size((ggml_type)d.type, d.n_in) * (size_t)d.n_out);
             }
+        }
+        if (multi && bank_zero_bytes) {
+            MOE_CACHE_LOG("[moe-cache] device tables skipped: bank experts need one device\n");
+            return fail();
         }
         ggml_cuda_set_device(device.logical);
         const void * bank_zero = bank_zero_bytes ? moe_bank_zero_block(device.logical, bank_zero_bytes) : nullptr;
@@ -13724,11 +13784,19 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                     session->device_tables.count(d.data)) {
                 return fail();
             }
+            moe_cache_device * owner = owner_of(d);
+            if (!owner) {
+                MOE_CACHE_LOG("[moe-cache] device tables skipped: no device runs the layer of %s\n", d.name ? d.name : "?");
+                return fail();
+            }
+            const size_t owner_index = device_index(owner);
+            ggml_cuda_set_device(owner->logical);
             moe_cache_device_table table;
+            table.owner = owner;
             table.desc = d;
             table.desc.expert_size = expert_bytes;
             table.host_stride = d.expert_size;
-            table.permanent_sources = moe_resident_tensor(d.data, device.logical);
+            table.permanent_sources = moe_resident_tensor(d.data, owner->logical);
             // A bank tensor can span pinned cold ranges and unregistered holes.
             const bool bank_sources = ggml_moe_bank_lookup(d.data) != nullptr;
             // fork: session-owned registrations must pass through retained_needed before pruning.
@@ -13745,7 +13813,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             count_entries += d.n_expert;
             for (int32_t e = 0; e < d.n_expert; ++e) {
                 const void * permanent = moe_resident_lookup_device((const char *)d.data + (size_t)e * d.expert_size,
-                        expert_bytes, device.logical);
+                        expert_bytes, owner->logical);
                 const void * address = permanent;
                 if (permanent) { hot_bytes += expert_bytes; table.permanent[e] = 1; }
                 if (!permanent && bank_zero && moe_bank_has(d.data, e)) {
@@ -13755,7 +13823,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                     ++table.n_bank;
                     ++bank_entries;
                 }
-                for (const auto & pool : device.pools) {
+                for (const auto & pool : owner->pools) {
                     if (permanent) { break; }
                     if (pool->expert_size != expert_bytes || pool->wtype != d.type) {
                         continue;
@@ -13796,28 +13864,31 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                 }
                 table.addresses[e] = address;
             }
-            table_bytes += (size_t) d.n_expert * (sizeof(void *) * (session->prefetch_enabled ? 2 : 1) + sizeof(unsigned long long) + (resident_mask ? sizeof(uint8_t) : 0));
-            if (!moe_cache_table_bytes_add(arena_bytes, (size_t)d.n_expert * sizeof(void *)) ||
-                    (session->prefetch_enabled && !moe_cache_table_bytes_add(arena_bytes, (size_t)d.n_expert * sizeof(void *))) ||
-                    (resident_mask && !moe_cache_table_bytes_add(arena_bytes, (size_t)d.n_expert)) ||
+            table_bytes[owner_index] += (size_t) d.n_expert * (sizeof(void *) * (session->prefetch_enabled ? 2 : 1) + sizeof(unsigned long long) + (resident_mask ? sizeof(uint8_t) : 0));
+            if (!moe_cache_table_bytes_add(arena_bytes[owner_index], (size_t)d.n_expert * sizeof(void *)) ||
+                    (session->prefetch_enabled && !moe_cache_table_bytes_add(arena_bytes[owner_index], (size_t)d.n_expert * sizeof(void *))) ||
+                    (resident_mask && !moe_cache_table_bytes_add(arena_bytes[owner_index], (size_t)d.n_expert)) ||
                     (moe_onepath() && table.n_bank > 0 &&
-                        (!moe_cache_table_bytes_add(arena_bytes, (size_t)d.n_expert * sizeof(void *)) ||
-                         !moe_cache_table_bytes_add(arena_bytes, (size_t)d.n_expert)))) {
+                        (!moe_cache_table_bytes_add(arena_bytes[owner_index], (size_t)d.n_expert * sizeof(void *)) ||
+                         !moe_cache_table_bytes_add(arena_bytes[owner_index], (size_t)d.n_expert)))) {
                 return fail();
             }
             auto & stored = session->device_tables.emplace(d.data, std::move(table)).first->second;
             stored.name = d.name ? d.name : "";
             stored.desc.name = d.name ? stored.name.c_str() : nullptr;
         }
-        if (!moe_cache_table_bytes_add(arena_bytes, count_entries * sizeof(unsigned long long)) ||
-                (route_stats && !moe_cache_table_bytes_add(arena_bytes, 3 * sizeof(unsigned long long)))) {
+        if (!multi && (!moe_cache_table_bytes_add(arena_bytes[0], count_entries * sizeof(unsigned long long)) ||
+                (route_stats && !moe_cache_table_bytes_add(arena_bytes[0], 3 * sizeof(unsigned long long))))) {
             return fail();
         }
         // Retire ranges no current miss needs before adding new exact copies.
         // Old kernels and tables were drained by the idle rerank; no published
         // address can observe this pruning. Unchanged cold sets copy nothing.
         size_t kept = 0, pruned_bytes = 0;
-        if (retained_ranges) { CUDA_CHECK(cudaDeviceSynchronize()); }
+        for (size_t i = retained_ranges ? n_devices : 0; i-- > 0;) {
+            ggml_cuda_set_device(session->devices[i]->logical);
+            CUDA_CHECK(cudaDeviceSynchronize());
+        }
         for (size_t i = 0; i < retained_ranges; ++i) {
             auto & range = session->mapped_ranges[i];
             if (!retained_needed[i]) {
@@ -13897,36 +13968,40 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             }
             return fail();
         }
-        ggml_cuda_set_device(device.logical);
-        size_t free_bytes = 0, total_bytes = 0;
         // Tables are mandatory generation workspace, not optional expert
         // slots. They may spend a bounded part of the configured generation
         // reserve. Keep at least 1 GiB physically free on the home card so
         // its driver allocations also fit below the 23,552 MiB card limit.
         const size_t table_workspace_cap = 64u << 20;
         const size_t physical_free_floor = moe_cache_physical_free_floor();
-        moe_cache_memory_view table_memory;
-        const cudaError_t table_query = ggml_cuda_mem_get_info_capped(&free_bytes, &total_bytes);
-        const bool budget_query = table_query == cudaSuccess && moe_cache_memory_query(device, table_memory);
-        const char * table_failure = table_query != cudaSuccess ? "cuda-memory-query" :
-                !budget_query ? "budget-query" : table_bytes > table_workspace_cap ? "table-cap" :
-                arena_bytes > device.table_arena_cap ? "arena-not-materialized" :
-                free_bytes < physical_free_floor ? "physical-free-floor" : nullptr;
-        MOE_CACHE_LOG("[moe-cache] CUDA%d device table workspace bytes: requested=%zu arena_required=%zu arena_allocated=%zu cap=%zu free=%zu total=%zu reserve=%zu other_outstanding=%zu physical_free_floor=%zu failure=%s policy=materialized-before-expert-pools\n",
-                device.physical, table_bytes, arena_bytes, device.table_arena_cap, table_workspace_cap,
-                free_bytes, total_bytes, table_memory.reserve, table_memory.other_outstanding,
-                physical_free_floor, table_failure ? table_failure : "none");
-        if (table_failure) {
-            return fail();
+        for (size_t i = n_devices; i-- > 0;) {
+            auto & table_device = *session->devices[i];
+            ggml_cuda_set_device(table_device.logical);
+            size_t free_bytes = 0, total_bytes = 0;
+            moe_cache_memory_view table_memory;
+            const cudaError_t table_query = ggml_cuda_mem_get_info_capped(&free_bytes, &total_bytes);
+            const bool budget_query = table_query == cudaSuccess && moe_cache_memory_query(table_device, table_memory);
+            const char * table_failure = table_query != cudaSuccess ? "cuda-memory-query" :
+                    !budget_query ? "budget-query" : table_bytes[i] > table_workspace_cap ? "table-cap" :
+                    arena_bytes[i] > table_device.table_arena_cap ? "arena-not-materialized" :
+                    free_bytes < physical_free_floor ? "physical-free-floor" : nullptr;
+            MOE_CACHE_LOG("[moe-cache] CUDA%d device table workspace bytes: requested=%zu arena_required=%zu arena_allocated=%zu cap=%zu free=%zu total=%zu reserve=%zu other_outstanding=%zu physical_free_floor=%zu failure=%s policy=materialized-before-expert-pools\n",
+                    table_device.physical, table_bytes[i], arena_bytes[i], table_device.table_arena_cap, table_workspace_cap,
+                    free_bytes, total_bytes, table_memory.reserve, table_memory.other_outstanding,
+                    physical_free_floor, table_failure ? table_failure : "none");
+            if (table_failure) {
+                return fail();
+            }
         }
-        size_t arena_used = 0;
-        auto table_take = [&](size_t bytes) -> void * {
+        std::vector<size_t> arena_used(n_devices, 0);
+        auto table_take = [&](size_t index, size_t bytes) -> void * {
+            auto & table_device = *session->devices[index];
             const size_t padded = (bytes + 255) & ~(size_t)255;
-            if (arena_used > device.table_arena_cap || padded > device.table_arena_cap - arena_used) {
+            if (arena_used[index] > table_device.table_arena_cap || padded > table_device.table_arena_cap - arena_used[index]) {
                 return nullptr;
             }
-            void * pointer = device.table_arena + arena_used;
-            arena_used += padded;
+            void * pointer = table_device.table_arena + arena_used[index];
+            arena_used[index] += padded;
             return pointer;
         };
         MOE_CACHE_LOG("[moe-cache] source mappings reuse: retained_ranges=%zu retained_copied_bytes=%zu retained_registered_bytes=%zu new_ranges=%zu newly_uncovered_bytes=%zu\n",
@@ -13962,6 +14037,7 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                 const uintptr_t bank_begin = (uintptr_t)d.data;
                 const size_t bank_bytes = entry.second.host_stride * (size_t)(d.n_expert - 1) + d.expert_size;
                 if (range.begin >= bank_begin && range.end - bank_begin <= bank_bytes) {
+                    ggml_cuda_set_device(entry.second.owner->logical);
                     contained = true;
                     break;
                 }
@@ -14040,19 +14116,21 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                 registration_calls, registration_ms, staging_calls, staging_alloc_ms, source_copy_ms);
         mappings.reset();
         session->device_previous_counts.assign(count_entries, 0);
-        session->device_expert_counts = (unsigned long long *)table_take(count_entries * sizeof(unsigned long long));
-        if (!session->device_expert_counts ||
-                cudaMemset(session->device_expert_counts, 0, count_entries * sizeof(unsigned long long)) != cudaSuccess) {
+        ggml_cuda_set_device(device.logical);
+        session->device_expert_counts = multi ? nullptr :
+                (unsigned long long *)table_take(0, count_entries * sizeof(unsigned long long));
+        if (!multi && (!session->device_expert_counts ||
+                cudaMemset(session->device_expert_counts, 0, count_entries * sizeof(unsigned long long)) != cudaSuccess)) {
             return fail();
         }
         if (route_stats) {
-            session->device_route_counts = (unsigned long long *)table_take(3 * sizeof(unsigned long long));
+            session->device_route_counts = (unsigned long long *)table_take(0, 3 * sizeof(unsigned long long));
             if (!session->device_route_counts ||
                     cudaMemset(session->device_route_counts, 0, 3 * sizeof(unsigned long long)) != cudaSuccess) {
                 return fail();
             }
         }
-        if (moe_missjoin_mode() && !g_missjoin_counts) {
+        if (!multi && moe_missjoin_mode() && !g_missjoin_counts) {
             if (!mask_only && (cudaMalloc((void **) &g_missjoin_counts, moe_missjoin_count_entries * sizeof(unsigned long long)) != cudaSuccess ||
                     cudaMemset(g_missjoin_counts, 0, moe_missjoin_count_entries * sizeof(unsigned long long)) != cudaSuccess)) {
                 g_missjoin_counts = nullptr;
@@ -14069,12 +14147,14 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         }
         for (auto & entry : session->device_tables) {
             auto & table = entry.second;
+            const size_t table_index = device_index(table.owner);
+            ggml_cuda_set_device(table.owner->logical);
             if (resident_mask) {
                 std::vector<uint8_t> hot(table.addresses.size());
                 for (size_t e = 0; e < hot.size(); ++e) {
                     hot[e] = table.addresses[e] != nullptr;
                 }
-                table.hot = (uint8_t *)table_take(hot.size());
+                table.hot = (uint8_t *)table_take(table_index, hot.size());
                 if (!table.hot || cudaMemcpy(table.hot, hot.data(), hot.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
                     return fail();
                 }
@@ -14104,12 +14184,12 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             }
             const size_t bytes = table.addresses.size() * sizeof(void *);
             if (session->prefetch_enabled) {
-                table.staging_device = (const void **) table_take(bytes);
+                table.staging_device = (const void **) table_take(table_index, bytes);
                 if (!table.staging_device || cudaMemcpy(table.staging_device, table.addresses.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
                     return fail();
                 }
             }
-            table.device = (const void **)table_take(bytes);
+            table.device = (const void **)table_take(table_index, bytes);
             if (!table.device || cudaMemcpy(table.device, table.addresses.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
                 return fail();
             }
@@ -14129,8 +14209,8 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                         flag[e] = 1;
                     }
                 }
-                table.ai_bank = (const void **) table_take(bytes);
-                table.ai_bank_flag = (uint8_t *) table_take(flag.size());
+                table.ai_bank = (const void **) table_take(table_index, bytes);
+                table.ai_bank_flag = (uint8_t *) table_take(table_index, flag.size());
                 if (!table.ai_bank || !table.ai_bank_flag ||
                         cudaMemcpy(table.ai_bank, ai.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess ||
                         cudaMemcpy(table.ai_bank_flag, flag.data(), flag.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
@@ -14150,10 +14230,12 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         MOE_CACHE_LOG("[moe-cache] host staging bytes: copied=%zu registered=%zu chunk_cap=%zu peak_service_current=%llu available=%zu\n",
                 staging_bytes, registered_bytes, staging_chunk_cap,
                 (unsigned long long) peak_service_current, moe_cache_mem_available());
-        moe_missjoin_overlap_prepare(*session);
-        moe_missjoin_retained_prepare(*session);
-        moe_pf_prepare(*session);
-        moe_table_prefetch_prepare(*session);
+        if (!multi) {
+            moe_missjoin_overlap_prepare(*session);
+            moe_missjoin_retained_prepare(*session);
+            moe_pf_prepare(*session);
+            moe_table_prefetch_prepare(*session);
+        }
         session->mapped_sources.clear();
         for (int i = 0; i < n_tensors; ++i) { session->mapped_sources.emplace(tensors[i].data, tensors[i]); }
         if (!session->device_profile_path.empty() && session->device_profile_tensors.size() == (size_t) n_tensors) {
@@ -14171,13 +14253,13 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
                 }
             }
         }
-        if (moe_cache_whole_only() && !moe_cache_swap_groups(*session, true)) {
+        if (!multi && moe_cache_whole_only() && !moe_cache_swap_groups(*session, true)) {
             MOE_CACHE_LOG("[moe-cache] whole-only device tables refused: resident bundles are incomplete\n");
             return fail();
         }
         session->device_capture_generation = g_moe_cache_capture_generation.fetch_add(1, std::memory_order_relaxed);
         GGML_ASSERT(session->device_capture_generation != 0);
-        if (getenv("GGML_MOE_SKIP_TRACE")) {
+        if (!multi && getenv("GGML_MOE_SKIP_TRACE")) {
             CUDA_CHECK(cudaMalloc(&session->mass_trace, 16384 * sizeof(moe_mass_record)));
             CUDA_CHECK(cudaMalloc((void **) &session->mass_trace_counts, 2 * sizeof(unsigned)));
             CUDA_CHECK(cudaMemset(session->mass_trace_counts, 0, 2 * sizeof(unsigned)));
@@ -14194,8 +14276,16 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
             MOE_CACHE_LOG("[moe-cache] one path %s: %zu of %zu banked tensors have bank rows\n",
                     banked > 0 && with_rows == banked ? "live" : "off (bank graph kept)", with_rows, banked);
         }
+        size_t table_bytes_total = 0;
+        for (size_t bytes : table_bytes) {
+            table_bytes_total += bytes;
+        }
         MOE_CACHE_LOG("[moe-cache] device tables active: %zu tensors, %zu MiB mapped existing pages, %zu KiB device tables; stable slots with boundary adaptation; no per-layer host routing or result copies\n",
-                session->device_tables.size(), (pin_bytes + retained_staging + retained_registered) >> 20, table_bytes >> 10);
+                session->device_tables.size(), (pin_bytes + retained_staging + retained_registered) >> 20, table_bytes_total >> 10);
+        if (multi) {
+            MOE_CACHE_LOG("[moe-cache] device tables follow the layer split over %zu devices, %zu MiB resident; swap, miss staging, CPU split and route counters are off\n",
+                    n_devices, hot_bytes >> 20);
+        }
         return 1;
     } catch (const std::exception & e) {
         MOE_CACHE_LOG("[moe-cache] device preparation failed: %s\n", e.what());
@@ -14213,6 +14303,14 @@ static void moe_cache_set_skip_tail(void * opaque, int rank, bool mass) {
     auto * session = (moe_cache_session *) opaque;
     if (!session || rank < 0 || rank > 9) {
         return;
+    }
+    if (session->devices.size() > 1 && (rank > 0 || mass)) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true)) {
+            MOE_CACHE_LOG("[moe-cache] expert skipping is off: it needs one device\n");
+        }
+        rank = 0;
+        mass = false;
     }
     const char * policy = getenv("GGML_MOE_SKIP_POLICY");
     int mode = !policy || strcmp(policy, "rank") == 0 ? 0 : strcmp(policy, "threshold") == 0 ? 1 : strcmp(policy, "cumulative") == 0 ? 2 : -1;
