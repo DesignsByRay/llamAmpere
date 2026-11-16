@@ -1466,6 +1466,12 @@ llama_context::llama_context(const llama_model & model, llama_context_params par
                                  !model.has_tensor_overrides() &&
                                  cparams.moe_cache_size == 0; // not supported by the MoE cache
 
+        // A draft (MTP) context decodes a few rows at a time and gains nothing from pipeline parallelism,
+        // and its plan slots (graph reuse per draft step) only run without it.
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+            pipeline_parallel = false;
+        }
+
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
             for (auto & backend : backends) {
