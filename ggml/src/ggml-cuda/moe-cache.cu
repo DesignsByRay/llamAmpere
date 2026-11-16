@@ -13942,6 +13942,26 @@ static int moe_cache_device_prepare(void * opaque, const ggml_moe_cache_tensor_d
         mappings.reset();
         MOE_CACHE_LOG("[moe-cache] source mappings prune: released_bytes=%zu retained_ranges=%zu policy=current-nonresident-experts-only\n",
                 pruned_bytes, retained_ranges);
+        // A new range that shares a page with a retained registered range cannot be registered beside it: the
+        // registry rejects the overlap. Give such a retained range back and register it again as part of the new
+        // one. Nothing reads the old aliases here, the tables are being rebuilt.
+        for (size_t i = 0; i < retained_ranges;) {
+            const moe_cache_mapped_range old = session->mapped_ranges[i];
+            bool overlap = false;
+            for (size_t k = 0; k < pending_ranges.size() && !overlap; ++k) {
+                overlap = pending_ranges[k].begin < old.end && old.begin < pending_ranges[k].end;
+            }
+            if (!old.registered || !overlap) {
+                ++i;
+                continue;
+            }
+            ggml_cuda_host_unregister((void *) old.begin);
+            retained_registered -= old.end - old.begin;
+            pending_ranges.push_back({old.begin, old.end, nullptr, nullptr, false});
+            session->mapped_ranges.erase(session->mapped_ranges.begin() + i);
+            --retained_ranges;
+        }
+        mappings.reset();
         auto & ranges = pending_ranges;
         std::sort(ranges.begin(), ranges.end(), [](const moe_cache_mapped_range & a, const moe_cache_mapped_range & b) {
             return a.begin < b.begin;
