@@ -6083,7 +6083,13 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
             sched_reserve(suspend_prompt_cache);
             break;
         } catch (const std::exception & error) {
-            if (!dynamic_ubatch || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) { throw; }
+            if (!dynamic_ubatch || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+                // several devices: a card with little free memory gets smaller prompt chunks, not a failed request
+                if (model.n_devices() <= 1 || rows <= 512) { throw; }
+                rows = std::max(512u, rows / 2);
+                LLAMA_LOG_WARN("%s: prompt scratch does not fit, trying %u rows\n", __func__, rows);
+                continue;
+            }
             const uint32_t floor = std::min(cparams.n_ubatch, std::max(256u, cparams.n_seq_max));
             LLAMA_LOG_WARN("%s: dynamic scratch %u rows failed: %s\n", __func__, rows, error.what());
             if (rows <= floor) { sched_need_reserve = true; return false; }
