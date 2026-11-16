@@ -1151,6 +1151,8 @@ struct moe_cache_session {
     std::vector<std::unique_ptr<moe_cache_device>> devices;
     std::unordered_map<int, int> layer_devices;
     std::unordered_map<const void *, int> tensor_devices;
+    // layer split: layer -> physical device that runs it. An owned layer is never routed to another device.
+    std::unordered_map<int, int> layer_owners;
 
     std::mutex mu;
     std::mutex fill_mu;
@@ -4472,8 +4474,17 @@ static void * moe_cache_begin(
             return nullptr;
         };
 
+        const auto owner = has_layer ? session->layer_owners.find(layer) : session->layer_owners.end();
+        const bool owned = owner != session->layer_owners.end();
+        if (owned) {
+            selected = find_routed_device(owner->second);
+            if (!selected || selected->dead.load() || route_weight(*selected) == 0) {
+                return nullptr;
+            }
+        }
+
         auto tensor_route = session->tensor_devices.find(host_base);
-        if (tensor_route != session->tensor_devices.end()) {
+        if (!owned && tensor_route != session->tensor_devices.end()) {
             selected = find_routed_device(tensor_route->second);
             if (!selected || selected->dead.load() ||
                 route_weight(*selected) == 0) {
@@ -14230,6 +14241,22 @@ static void moe_cache_set_skip_tail(void * opaque, int rank, bool mass) {
     }
 }
 
+static void moe_cache_set_layer_device(void * opaque, int layer, void * backend) {
+    auto * session = (moe_cache_session *) opaque;
+    if (!session || layer < 0 || !backend || !ggml_backend_is_cuda((ggml_backend_t) backend)) {
+        return;
+    }
+    const int logical = ((ggml_backend_cuda_context *) ((ggml_backend_t) backend)->context)->device;
+    std::lock_guard<std::mutex> lock(session->mu);
+    for (const auto & device : session->devices) {
+        if (device->logical == logical) {
+            session->layer_owners[layer] = device->physical;
+            session->layer_devices[layer] = device->physical;
+            return;
+        }
+    }
+}
+
 static void moe_cache_register(const void * owner) {
     g_moe_cache_owner = owner;
     ggml_moe_cache_api api = {};
@@ -14269,6 +14296,7 @@ static void moe_cache_register(const void * owner) {
     api.prompt_resume = moe_cache_prompt_resume;
     api.resident = moe_cache_resident;
     api.set_skip_tail = moe_cache_set_skip_tail;
+    api.set_layer_device = moe_cache_set_layer_device;
     ggml_moe_cache_register(&api);
 }
 

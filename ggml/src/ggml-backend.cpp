@@ -1350,6 +1350,9 @@ struct ggml_backend_sched {
     enum ggml_moe_cache_mode moe_cache_mode_last;
     size_t                   moe_cache_budget_last;
     bool                     moe_cache_suspended;
+    // layer split: backend id that runs each layer (-1 = none), given to every new session
+    int * moe_layer_backend_ids;
+    int   moe_n_layer_backends;
     int                      moe_cache_prefetch_mode;
     // expert keep policy (#215/#217), owned copy; keep_default -1 and n_layer 0 = off
     int32_t   moe_keep_default;
@@ -3315,6 +3318,42 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     return GGML_STATUS_SUCCESS;
 }
 
+static void ggml_sched_moe_cache_layer_devices(ggml_backend_sched_t sched) {
+    if (!sched->moe_cache_session || !sched->moe_cache_api.set_layer_device) {
+        return;
+    }
+    for (int il = 0; il < sched->moe_n_layer_backends; il++) {
+        const int id = sched->moe_layer_backend_ids[il];
+        if (id >= 0 && id < sched->n_backends) {
+            sched->moe_cache_api.set_layer_device(sched->moe_cache_session, il, sched->backends[id]);
+        }
+    }
+}
+
+void ggml_backend_sched_set_moe_cache_layer_backends(ggml_backend_sched_t sched,
+        const ggml_backend_t * backends, int n_layer) {
+    GGML_ASSERT(sched);
+    free(sched->moe_layer_backend_ids);
+    sched->moe_layer_backend_ids = nullptr;
+    sched->moe_n_layer_backends  = 0;
+    if (!backends || n_layer <= 0) {
+        return;
+    }
+    sched->moe_layer_backend_ids = (int *) malloc((size_t) n_layer * sizeof(int));
+    GGML_ASSERT(sched->moe_layer_backend_ids);
+    sched->moe_n_layer_backends = n_layer;
+    for (int il = 0; il < n_layer; il++) {
+        sched->moe_layer_backend_ids[il] = -1;
+        for (int id = 0; id < sched->n_backends; id++) {
+            if (backends[il] && sched->backends[id] == backends[il]) {
+                sched->moe_layer_backend_ids[il] = id;
+                break;
+            }
+        }
+    }
+    ggml_sched_moe_cache_layer_devices(sched);
+}
+
 // the session a new scheduler gets when nobody sets a mode: the first provider that accepts the default config
 static void ggml_sched_moe_cache_default(ggml_backend_sched_t sched) {
     void * cache_backends[GGML_SCHED_MAX_BACKENDS];
@@ -3331,6 +3370,7 @@ static void ggml_sched_moe_cache_default(ggml_backend_sched_t sched) {
             break;
         }
     }
+    ggml_sched_moe_cache_layer_devices(sched);
 }
 
 ggml_backend_sched_t ggml_backend_sched_new(
@@ -3490,6 +3530,7 @@ void ggml_backend_sched_set_moe_cache(
     if (provider_tried && !sched->moe_cache_session) {
         GGML_LOG_INFO("[moe-cache] session creation failed: all candidate providers returned null\n");
     }
+    ggml_sched_moe_cache_layer_devices(sched);
 }
 
 // fork: warm the serving cache without synthetic decode plans or calibration samples.
@@ -3687,6 +3728,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         free(p->graph.leafs);
         free(p);
     }
+    free(sched->moe_layer_backend_ids);
     free(sched);
 }
 
