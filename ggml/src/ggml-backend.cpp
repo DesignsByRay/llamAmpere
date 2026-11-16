@@ -2298,6 +2298,19 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 return b;
             }
         }
+        // Layer split: an expert op too large for the device tables still runs on the device that holds its
+        // layer, so its experts come from that device's resident copies and not from host memory.
+        const struct ggml_tensor * w = tensor->src[0];
+        int layer = -1;
+        if (sched->moe_layer_backend_ids && w && w->buffer && ggml_backend_buffer_is_host(w->buffer) &&
+                w->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                sscanf(w->name, "blk.%d.", &layer) == 1 && layer >= 0 && layer < sched->moe_n_layer_backends) {
+            const int owner = sched->moe_layer_backend_ids[layer];
+            if (owner >= 0 && owner < sched->n_backends - 1 && ggml_backend_supports_op(sched->backends[owner], tensor)) {
+                SET_CAUSE(tensor, "1.moe-layer");
+                return owner;
+            }
+        }
     }
 
     // operations with weights are preferably run on the same backend as the weights
