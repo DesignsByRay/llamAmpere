@@ -165,6 +165,9 @@ struct ggml_moe_cache_api {
     // output rows are zero and its weights are never read. mass independently enables the environment-selected
     // weight-budget policy; rank 0 and mass false keep the window exact. NULL means always exact.
     void (*set_skip_tail)(void * session, int rank, bool mass);
+
+    // Layer split: the experts of "blk.<layer>." tensors are cached only on this backend's device. Optional.
+    void (*set_layer_device)(void * session, int layer, void * backend);
 };
 
 // plan() slot index for a row the route-rank cutoff left out: the caller writes a zero row and does no work.
@@ -199,6 +202,11 @@ GGML_API int ggml_backend_sched_moe_cache_warm(ggml_backend_sched_t sched,
 GGML_API void ggml_backend_sched_moe_cache_print_stats(ggml_backend_sched_t sched);
 GGML_API int ggml_backend_sched_moe_cache_decode_capacity(ggml_backend_sched_t sched, int64_t n_expert_used,
         const int32_t * types, int n_types);
+
+// Layer split: backends[il] runs layer il (NULL = no owner). The scheduler keeps the map and gives it to every
+// session it makes. n_layer 0 clears it.
+GGML_API void ggml_backend_sched_set_moe_cache_layer_backends(ggml_backend_sched_t sched,
+        const ggml_backend_t * backends, int n_layer);
 
 GGML_API int ggml_backend_sched_moe_cache_device_prepare(ggml_backend_sched_t sched,
         const struct ggml_moe_cache_tensor_desc * tensors, int n_tensors);

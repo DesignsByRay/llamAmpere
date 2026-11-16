@@ -2405,6 +2405,24 @@ void llama_context::sched_new(const sched_params & params) {
     sched_params_cur = params;
 }
 
+// Layer split over several devices: tell the expert cache which backend runs each layer.
+static void llama_sched_set_moe_layer_backends(ggml_backend_sched_t sched, const llama_model & model,
+        const std::vector<ggml_backend_ptr> & backends) {
+    if (model.n_devices() <= 1 || model.split_mode() != LLAMA_SPLIT_MODE_LAYER) {
+        return;
+    }
+    std::vector<ggml_backend_t> layer_backends(model.hparams.n_layer(), nullptr);
+    for (size_t il = 0; il < layer_backends.size(); il++) {
+        for (const auto & backend : backends) {
+            if (ggml_backend_get_device(backend.get()) == model.dev_layer((int) il)) {
+                layer_backends[il] = backend.get();
+                break;
+            }
+        }
+    }
+    ggml_backend_sched_set_moe_cache_layer_backends(sched, layer_backends.data(), (int) layer_backends.size());
+}
+
 void llama_context::sched_reserve(bool suspend_prompt_cache) {
     if (!sched_need_reserve) {
         return;
@@ -2553,6 +2571,7 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
         }
     }
     if (!preserve_cache) {
+        llama_sched_set_moe_layer_backends(sched.get(), model, backends);
         ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
         ggml_backend_sched_moe_cache_prefetch_configure(sched.get(), cparams.moe_prefetch);
     }
@@ -2820,6 +2839,7 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
                 if (mtp_prefill_async || mtp_scratch_enabled || llama_kq_mask_device_enabled()) {
                     ggml_backend_sched_set_input_copy_callback(sched.get(), sched_copy_mtp_inputs, this);
                 }
+                llama_sched_set_moe_layer_backends(sched.get(), model, backends);
                 ggml_backend_sched_set_moe_cache(sched.get(), moe_cache_mode, cparams.moe_cache_budget_mib);
                 ggml_backend_sched_moe_cache_prefetch_configure(sched.get(), cparams.moe_prefetch);
                 sync_moe_keep();
