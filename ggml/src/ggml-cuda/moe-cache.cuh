@@ -6,6 +6,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "ggml-backend.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -269,5 +271,5 @@ bool ggml_cuda_moe_skipmass_compute(ggml_backend_cuda_context & ctx, ggml_tensor
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // Host planner fixture; does not initialize CUDA.
-bool ggml_cuda_moe_cache_swap_async_test();
+GGML_BACKEND_API bool ggml_cuda_moe_cache_swap_async_test();
 #endif
