@@ -5410,6 +5410,7 @@ static bool run_device_host_budget() {
 
 // Reading this process's pagemap reveals present bits without touching the
 // advised mapping. PFN access is unnecessary. The mapping remains readable.
+#if defined(__linux__)
 static int present_source_pages(const void * base, size_t bytes) {
     const size_t page = (size_t) sysconf(_SC_PAGESIZE);
     const int fd = open("/proc/self/pagemap", O_RDONLY);
@@ -5430,8 +5431,16 @@ static int present_source_pages(const void * base, size_t bytes) {
     close(fd);
     return present;
 }
+#endif
 
 static bool run_device_adaptation(ggml_backend_t gpu, ggml_backend_t cpu, log_capture & capture, bool with_capture = false, bool with_source_reuse = false, bool with_tuning = false) {
+#if !defined(__linux__)
+    // The source reuse variant maps a file and reads /proc/self/pagemap.
+    if (with_source_reuse) {
+        printf("cache-device-source-reuse: SKIP (Linux only)\n");
+        return true;
+    }
+#endif
     configure_cache(nullptr, "8");
     // Include the bounded runtime workspace as well as the 64 expert slots.
     set_env("GGML_CUDA_MOE_CACHE_BUDGET_MB", "8");
@@ -5470,6 +5479,7 @@ static bool run_device_adaptation(ggml_backend_t gpu, ggml_backend_t cpu, log_ca
         ok &= passed;
     };
     ggml_backend_tensor_set(weights, quantized.data(), 0, quantized.size());
+#if defined(__linux__)
     void * readonly_mapping = MAP_FAILED;
     if (with_source_reuse) {
         const char * directory = getenv("GGML_MOE_CACHE_TEST_TMPDIR");
@@ -5499,6 +5509,7 @@ static bool run_device_adaptation(ggml_backend_t gpu, ggml_backend_t cpu, log_ca
             ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         }
     }
+#endif
     values.resize(width);
     ggml_backend_tensor_set(acts, values.data(), 0, width * sizeof(float));
     std::vector<int32_t> initial_ids(route_count, 64);
@@ -5533,6 +5544,7 @@ static bool run_device_adaptation(ggml_backend_t gpu, ggml_backend_t cpu, log_ca
             std::vector<float> actual(expected.size()), first;
             void * source_probe = nullptr;
             size_t source_probe_bytes = 0;
+#if defined(__linux__)
             if (with_source_reuse && expert == 64) {
                 const size_t page = (size_t) sysconf(_SC_PAGESIZE);
                 const uintptr_t begin = (uintptr_t) weights->data + 64 * descriptor.expert_size;
@@ -5547,6 +5559,7 @@ static bool run_device_adaptation(ggml_backend_t gpu, ggml_backend_t cpu, log_ca
                 require((madvise(source_probe, source_probe_bytes, MADV_DONTNEED) == 0), __LINE__);
                 require((present_source_pages(source_probe, source_probe_bytes) == 0), __LINE__);
             }
+#endif
             // Same graph, enough replays to fill a cold expert and subsequently
             // count it as resident. The second phase must evict another slot.
             for (int replay = 0; replay < 128; ++replay) {
@@ -5559,12 +5572,17 @@ static bool run_device_adaptation(ggml_backend_t gpu, ggml_backend_t cpu, log_ca
                     require((actual == first), __LINE__);
                 }
             }
+#if defined(__linux__)
             if (source_probe) {
                 const int touched = present_source_pages(source_probe, source_probe_bytes);
                 require((touched == 0), __LINE__);
                 fprintf(stderr, "cache-device-source-reuse original_full_pages=%zu present_after_promotion=%d; mapping stays readable\n",
                         source_probe_bytes / (size_t) sysconf(_SC_PAGESIZE), touched);
             }
+#else
+            (void) source_probe;
+            (void) source_probe_bytes;
+#endif
         }
     }
     if (prepared && with_source_reuse) {
@@ -5713,7 +5731,9 @@ static bool run_device_adaptation(ggml_backend_t gpu, ggml_backend_t cpu, log_ca
     ggml_backend_buffer_free(input_buffer);
     ggml_free(inputs);
     ggml_backend_buffer_free(buffer);
+#if defined(__linux__)
     if (readonly_mapping != MAP_FAILED) { munmap(readonly_mapping, quantized.size()); }
+#endif
     ggml_free(ctx);
     set_env("GGML_MOE_CACHE_DEVICE", nullptr);
     set_env("GGML_MOE_CACHE_DEVICE_STATS", nullptr);
