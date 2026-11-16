@@ -9470,6 +9470,8 @@ void ggml_cuda_moe_cache_table_graph_end(ggml_backend_cuda_context & ctx) {
 
 // outcomes of moe_cache_device_copy: done, tables not ready, no table, other device or shape, expert not resident
 static std::atomic<uint64_t> g_moe_device_copy_stats[5];
+static std::atomic<uint64_t> g_moe_device_copy_calls{0};
+static std::atomic<uint64_t> g_moe_device_copy_experts{0};
 
 static void moe_cache_device_release(moe_cache_session & session, bool retain_sources) {
     if (session.mass_trace) {
@@ -9490,10 +9492,11 @@ static void moe_cache_device_release(moe_cache_session & session, bool retain_so
     }
     moe_pf_release(&session); // fork PREFETCHFIX: tables below are about to be freed
     if (session.devices.size() > 1 && session.device_ready.load()) {
-        MOE_CACHE_LOG("[moe-cache] device copies for prompt graphs (process total): done=%llu not-ready=%llu no-table=%llu other-device=%llu not-resident=%llu\n",
+        MOE_CACHE_LOG("[moe-cache] device copies for prompt graphs (process total): done=%llu not-ready=%llu no-table=%llu other-device=%llu not-resident=%llu experts=%llu copy-calls=%llu\n",
                 (unsigned long long) g_moe_device_copy_stats[0].load(), (unsigned long long) g_moe_device_copy_stats[1].load(),
                 (unsigned long long) g_moe_device_copy_stats[2].load(), (unsigned long long) g_moe_device_copy_stats[3].load(),
-                (unsigned long long) g_moe_device_copy_stats[4].load());
+                (unsigned long long) g_moe_device_copy_stats[4].load(), (unsigned long long) g_moe_device_copy_experts.load(),
+                (unsigned long long) g_moe_device_copy_calls.load());
     }
     session.device_ready.store(false);
     ggml_moe_bank_onepath_set_live(false);
@@ -9644,6 +9647,26 @@ static int moe_cache_decode_capacity(void * opaque, int64_t n_expert_used, const
     return capacity;
 }
 
+// One block column per expert, split into slices along y; copies 8-byte words and then the last bytes.
+static __global__ void moe_device_gather_kernel(const void * const * table, char * dst, size_t stride, size_t bytes) {
+    const char * src = (const char *) table[blockIdx.x];
+    char * out = dst + (size_t) blockIdx.x * stride;
+    const size_t words = bytes / 8;
+    const size_t per_slice = (words + gridDim.y - 1) / gridDim.y;
+    const size_t begin = (size_t) blockIdx.y * per_slice;
+    const size_t end = begin + per_slice < words ? begin + per_slice : words;
+    const unsigned long long * s = (const unsigned long long *) src;
+    unsigned long long * d = (unsigned long long *) out;
+    for (size_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
+        d[i] = s[i];
+    }
+    if (blockIdx.y == 0 && threadIdx.x == 0) {
+        for (size_t i = words * 8; i < bytes; ++i) {
+            out[i] = src[i];
+        }
+    }
+}
+
 // Layer split only: a prompt graph gets its experts from the owner's resident copies, not from host memory.
 static int moe_cache_device_copy(void * opaque, void * backend, ggml_tensor * dst, const void * host_base,
         const uint8_t * used, int64_t n_expert, size_t dst_stride) {
@@ -9681,16 +9704,46 @@ static int moe_cache_device_copy(void * opaque, void * backend, ggml_tensor * ds
     g_moe_device_copy_stats[0]++;
     ggml_cuda_set_device(ctx->device);
     cudaStream_t stream = ctx->stream();
-    for (int64_t e = 0; e < n_expert; ++e) {
+    // Every expert resident: one kernel copies the whole tensor through the pointer table on the card. The
+    // pool slots are not in expert order, so separate copies would be one call per expert. Experts the batch
+    // does not use are copied too; nothing reads them.
+    bool gather = table.device != nullptr && expert_bytes >= 8 && dst_stride % 8 == 0 &&
+        (uintptr_t) dst->data % 8 == 0;
+    for (int64_t e = 0; e < n_expert && gather; ++e) {
+        gather = table.resident[e] && (uintptr_t) table.addresses[e] % 8 == 0;
+    }
+    if (gather) {
+        const int slices = (int) std::min<size_t>(64, std::max<size_t>(1, expert_bytes / (8 * 4096)));
+        moe_device_gather_kernel<<<dim3((unsigned) n_expert, (unsigned) slices), 256, 0, stream>>>(
+                (const void * const *) table.device, (char *) dst->data, dst_stride, expert_bytes);
+        CUDA_CHECK(cudaGetLastError());
+        g_moe_device_copy_calls++;
+        g_moe_device_copy_experts += (uint64_t) n_expert;
+        return 1;
+    }
+    // Experts that follow each other in the pool and in the target go in one copy.
+    const bool packed = dst_stride == expert_bytes;
+    for (int64_t e = 0; e < n_expert;) {
         if (!used[e]) {
+            ++e;
             continue;
         }
-        char * target = (char *) dst->data + (size_t) e * dst_stride;
-        CUDA_CHECK(cudaMemcpyAsync(target, table.addresses[e], expert_bytes, cudaMemcpyDeviceToDevice, stream));
-        // same zero bytes after an expert as the host upload writes
-        if (e + 1 < n_expert && !used[e + 1]) {
-            CUDA_CHECK(cudaMemsetAsync(target + dst_stride, 0, std::min(expert_bytes, (size_t) 512), stream));
+        int64_t last = e;
+        while (packed && last + 1 < n_expert && used[last + 1] &&
+                (const char *) table.addresses[last + 1] == (const char *) table.addresses[last] + expert_bytes) {
+            ++last;
         }
+        char * target = (char *) dst->data + (size_t) e * dst_stride;
+        CUDA_CHECK(cudaMemcpyAsync(target, table.addresses[e], (size_t) (last - e + 1) * expert_bytes,
+                    cudaMemcpyDeviceToDevice, stream));
+        g_moe_device_copy_calls++;
+        g_moe_device_copy_experts += (uint64_t) (last - e + 1);
+        // same zero bytes after an expert as the host upload writes
+        if (last + 1 < n_expert && !used[last + 1]) {
+            CUDA_CHECK(cudaMemsetAsync((char *) dst->data + (size_t) (last + 1) * dst_stride, 0,
+                        std::min(expert_bytes, (size_t) 512), stream));
+        }
+        e = last + 1;
     }
     return 1;
 }
