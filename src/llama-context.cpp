@@ -5514,7 +5514,21 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     const bool suspend_prompt_cache = b1 && alone && n_tokens >= 16384 &&
         (b1_ffn_scratch_active || b1_layer_scratch_active) && suspend_early && suspend_early[0] == '1' &&
         suspend_cache && suspend_cache[0] == '1';
-    sched_reserve(suspend_prompt_cache);
+    for (;;) {
+        try {
+            sched_reserve(suspend_prompt_cache);
+            break;
+        } catch (const std::runtime_error &) {
+            // several devices: a card with little free memory gets smaller prompt chunks, not a failed request
+            if (model.n_devices() <= 1 || rows <= 512) {
+                throw;
+            }
+            rows = std::max(512u, rows / 2);
+            LLAMA_LOG_WARN("%s: prompt scratch does not fit, trying %u rows\n", __func__, rows);
+            sched_reserve_tokens = rows;
+            sched_need_reserve = true;
+        }
+    }
     if (rows < previous || trim_packed) {
         b1_cache_needs_refresh = true;
     }
