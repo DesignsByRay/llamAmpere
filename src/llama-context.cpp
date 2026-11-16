@@ -5983,7 +5983,9 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     rows = std::min(rows, cparams.n_ubatch);
     // fork: packed prefill grows single-layer graphs, not a full-model MoE graph.
     const char * packed = getenv("LLAMA_B1_FFN");
-    if (alone && n_tokens >= 16384 && packed && packed[0] == '1' &&
+    // the single-layer graphs below need B1, which needs one GPU
+    const bool one_gpu = model.n_devices() <= 1;
+    if (one_gpu && alone && n_tokens >= 16384 && packed && packed[0] == '1' &&
             cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && model.arch == LLM_ARCH_QWEN4EXP &&
             loras->empty() && model.exl3_sides.empty() && model.hadamard_inverses.empty()) {
         rows = std::min(512u, cparams.n_ubatch);
@@ -5991,7 +5993,7 @@ bool llama_context::prompt_buffers_resize(uint32_t n_tokens, const llama_batch_e
     }
     const char * layer_reserve = getenv("LLAMA_B1_LAYER_RESERVE");
     const char * layer_major = getenv("LLAMA_B1");
-    if (!b1_ffn_scratch_active && alone && n_tokens >= 16384 && layer_reserve && layer_reserve[0] == '1' &&
+    if (one_gpu && !b1_ffn_scratch_active && alone && n_tokens >= 16384 && layer_reserve && layer_reserve[0] == '1' &&
             layer_major && layer_major[0] == '1' && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
             model.arch == LLM_ARCH_QWEN4EXP && loras->empty() && model.exl3_sides.empty() &&
             model.hadamard_inverses.empty()) {
