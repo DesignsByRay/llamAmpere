@@ -168,6 +168,12 @@ struct ggml_moe_cache_api {
 
     // Layer split: the experts of "blk.<layer>." tensors are cached only on this backend's device. Optional.
     void (*set_layer_device)(void * session, int layer, void * backend);
+
+    // Copy the experts flagged in used from this backend's device tables into dst (expert e at e * dst_stride).
+    // Returns 1 when every flagged expert was resident on that device and is queued on the backend's stream;
+    // 0 when nothing was copied. Optional.
+    int (*device_copy)(void * session, void * backend, struct ggml_tensor * dst, const void * host_base,
+                       const uint8_t * used, int64_t n_expert, size_t dst_stride);
 };
 
 // plan() slot index for a row the route-rank cutoff left out: the caller writes a zero row and does no work.
@@ -207,6 +213,10 @@ GGML_API int ggml_backend_sched_moe_cache_decode_capacity(ggml_backend_sched_t s
 // session it makes. n_layer 0 clears it.
 GGML_API void ggml_backend_sched_set_moe_cache_layer_backends(ggml_backend_sched_t sched,
         const ggml_backend_t * backends, int n_layer);
+
+// For a copy callback: fill dst from experts that are resident on the backend's device. 1 = done, 0 = not done.
+GGML_API int ggml_backend_sched_moe_cache_device_copy(ggml_backend_sched_t sched, ggml_backend_t backend,
+        struct ggml_tensor * dst, const void * host_base, const uint8_t * used, int64_t n_expert, size_t dst_stride);
 
 GGML_API int ggml_backend_sched_moe_cache_device_prepare(ggml_backend_sched_t sched,
         const struct ggml_moe_cache_tensor_desc * tensors, int n_tensors);

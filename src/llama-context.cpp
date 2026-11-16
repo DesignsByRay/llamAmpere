@@ -8214,6 +8214,36 @@ bool llama_context::sched_copy_mtp_inputs(ggml_backend_t backend, const ggml_ten
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
     auto * lctx = static_cast<llama_context *>(user_data);
 
+    // Layer split: experts that are resident on this card are copied on the card, not uploaded again.
+    if (lctx->b1_cache_device_active && lctx->model.n_devices() > 1 && src->ne[3] == 1 && src->data &&
+            strstr(src->name, "_exps.weight") && ggml_graph_n_nodes(graph) > 0) {
+        const auto * node = ggml_graph_node(graph, 0);
+        if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] == dst) {
+            const auto * ids = node->src[2];
+            std::vector<int32_t> data(ggml_nbytes(ids) / sizeof(int32_t));
+            std::vector<uint8_t> used((size_t) src->ne[2], 0);
+            if (!data.empty()) {
+                ggml_backend_tensor_get_async(backend, ids, data.data(), 0, ggml_nbytes(ids));
+                ggml_backend_synchronize(backend);
+            }
+            bool valid = true;
+            for (int64_t token = 0; token < ids->ne[1] && valid; ++token) {
+                for (int64_t rank = 0; rank < ids->ne[0]; ++rank) {
+                    const int32_t id = data[(token * ids->nb[1] + rank * ids->nb[0]) / sizeof(int32_t)];
+                    if (id < 0 || id >= src->ne[2]) {
+                        valid = false;
+                        break;
+                    }
+                    used[id] = 1;
+                }
+            }
+            if (valid && ggml_backend_sched_moe_cache_device_copy(lctx->sched.get(), backend, dst, src->data,
+                        used.data(), src->ne[2], dst->nb[2])) {
+                return true;
+            }
+        }
+    }
+
     // fork: pack arena expert planes without copying the intervening roles.
     const size_t expert_bytes = src->nb[1] * src->ne[1];
     if (src->ne[3] == 1 && src->nb[2] != dst->nb[2] && dst->nb[2] == expert_bytes &&
