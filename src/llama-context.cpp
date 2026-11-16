@@ -2590,6 +2590,12 @@ void llama_context::sched_reserve(bool suspend_prompt_cache) {
             trim += need > free ? need - free : 0;
         }
         if (trim > 0) {
+            // Several devices: a loan from the expert cache retires the device tables, and the prompt then
+            // reads every expert from host memory. Smaller prompt chunks that fit without a loan are faster;
+            // prompt_buffers_resize retries with half the rows.
+            if (model.n_devices() > 1 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && n_tokens > 1024) {
+                throw std::runtime_error("turn scratch does not fit beside the expert cache");
+            }
             b1_cache_needs_refresh = true;
             const size_t released = ggml_backend_sched_moe_cache_trim(sched.get(), trim);
             LLAMA_LOG_INFO("%s: turn scratch borrowed %.2f MiB (requested %.2f MiB)\n", __func__, released / 1048576.0, trim / 1048576.0);
