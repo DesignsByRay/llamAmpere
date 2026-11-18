@@ -1,145 +1,114 @@
-# llamAmpere
+# Flash-Next on two or three cards: per-device expert tables for a layer split
 
-llamAmpere is a fast version of llama.cpp (the open-source program that runs AI language models on your own computer),
-tuned for NVIDIA RTX 30-series "Ampere" graphics cards, especially the RTX 3090 and 3090 Ti. It runs Qwen3.8 models,
-including Qwen3.8-27B with its built-in MTP draft head (a small helper that guesses several words ahead so the model
-writes faster) and Qwen3.8 Flash-Next.
+> **AI-assisted work.** The code on this branch and this document were written with an AI coding assistant (Claude Code). I directed the work, ran it on my own machine and reviewed the results. Every commit carries a `Co-Authored-By` line that says so. Please read the numbers and claims below with that in mind.
 
-## What's new in v0.6.4
+Branch: `multi-gpu-device-tables`, 13 commits on top of llamAmpere v0.6.4 (`a5d8684`). It is NOT rebased onto v0.7.
 
-- Fix: Flash-Next ran out of memory or stalled on machines with two or more NVIDIA cards, or on a card that another program was already using (#96). v0.6.4 runs Flash-Next on one card, the one with the most free memory (`--device` picks another); splitting it across two cards is not supported yet. On a busy card with less than 8 GiB free, the launcher uses the memory planner, which runs but is slow. One idle card: unchanged. [Release notes](docs/llamampere-v0.6.4/RELEASE_NOTES.md).
+This page replaces the project README on this branch only. The original llamAmpere README is unchanged in [README-llamAmpere.md](README-llamAmpere.md). The code-only branch is `multi-gpu-device-tables`.
 
-## What's new in v0.6.3.11
+## Purpose
 
-- Fix: faster first token on short follow-up messages (up to 256 new tokens) after a long first message, on Flash-Next. Longer follow-ups are unchanged. [Release notes](docs/llamampere-v0.6.3.11/RELEASE_NOTES.md).
+v0.6.4 runs Flash-Next on one card. Its release notes say that splitting it across two cards is not supported yet. On my machine (3x RTX 3090) the split path as shipped was not usable: 0.7 tokens/s writing.
 
-## What's new in v0.6.3.10
+This branch makes the device expert tables work per card when the model is split by layer (`-sm layer`, the default). Each card holds the experts of the layers it runs. One-card behaviour is unchanged.
 
-- Fix: slow first token on short follow-up messages after a long conversation. [Release notes](docs/llamampere-v0.6.3.10/RELEASE_NOTES.md).
+## The bug found on the way (not specific to this branch)
 
-## What's new in v0.6.3.9
+Commit `d63a678` fixes a memory lifetime fault in the CUDA side-stream code. It is in v0.6.4 source and only shows when a model is split over several backends, so one-card use never hits it. I checked that the fix is not in v0.7.0.1.
 
-- Flash-Next on native Windows builds (MSVC + CUDA) can use the fast card-side expert tables, which were Linux-only. The contributor measured 0.26 -> 60 tokens/s on code on an RTX 3090 with 64 GB RAM. Thanks to huhichao (#98). We have no Windows machine: built and tested under MinGW/Wine, a CPU-only build that cannot compile the CUDA and MSVC parts; Windows speed figures are from the contributor. Linux is unchanged. [Release notes](docs/llamampere-v0.6.3.9/RELEASE_NOTES.md).
+What happens:
 
-## What's new in v0.6.3.8
+- A side-stream chain (the shared-expert chain or the Q/K/V group, `ggml_cuda_shexp_chain_find` and `ggml_cuda_side_group_find` in `ggml-cuda.cu`) runs on a second CUDA stream while the main stream goes on.
+- The code keeps the chain's inputs allocated until the join, but only inputs that are nodes of the split graph.
+- With a layer split the scheduler gives each card its own copy of a graph input, here the positions (`inp_pos`). That copy is not a graph node, so it was not kept.
+- Its memory was handed to main-stream nodes while the side-stream ROPE kernels could still read it.
+- When a graph is evaluated the kernels are issued in order and nothing goes wrong. When a captured CUDA graph is replayed the two streams really run in parallel. On the last card the positions were then sometimes read wrong.
 
-- The DFlash2 drafter on dense Swift 1.5 27B writes about 3.4 times faster (27 -> 93 tokens/s at temperature 1.0 on an RTX 3090 Ti, 100K prompt). A mixing step in the drafter ran twice per layer; it now runs once. The big model still checks every guess, so output quality is unchanged. MTP and Flash-Next are not affected. [Release notes](docs/llamampere-v0.6.3.8/RELEASE_NOTES.md).
+Symptom: with the drafter on and a layer split, the output changed from run to run at temperature 0.
 
-## What's new in v0.6.3.6
+How it was found: turning off the Q/K/V side stream (`GGML_CUDA_QKV_SIDE=0`) made the output repeatable. A dump of the data ranges of every node between a group's start and its join then showed the overlaps: 6 in layer 47 on the last card, 2 each in layers 15 and 31. After the fix: 0 overlaps in 91 side runs.
 
-- Flash-Next runs AI4, a four-bit AI+ model file, [qwen3.8-flash-next-Swift1.5-ATX-AI4](https://huggingface.co/jakeatx/qwen3.8-flash-next-Swift1.5-ATX-AI4) (84.97 GiB, closer to the Swift-Q8 reference than UD-IQ4_XS). Not recommended on 64 GB RAM machines unless you pin a large share of experts on the GPU and move the backup copies out of VRAM to cut RAM use.
-- Fixes the Linux build failure with Clang and some other compilers (#98). Saved prompt caches are keyed by expert-routing and GGML_ settings. [Release notes](docs/llamampere-v0.6.3.6/RELEASE_NOTES.md).
+The fix: inputs of a side-stream chain that are not graph nodes and not model weights are added to the chain's kept inputs (12 lines).
 
-## What's new in v0.6.3.5
+How to reproduce (needs two or more CUDA devices):
 
-- Flash-Next leaves more temporary card memory for long prompts on small cards. Explicit memory settings still win. [Release notes and hardware limits](docs/llamampere-v0.6.3.5/RELEASE_NOTES.md).
+1. Build this branch at commit `17ed920` (the commit before the fix).
+2. Start the server with Flash-Next split over the cards and the drafter on.
+3. Use the repeatable settings: `--moe-skip off --moe-skip-budget 0 --moe-skip-rank-floor 0 --no-spec-mb-mtp --no-moe-cpu-split --spec-type draft-mtp --spec-draft-n-max 3`, with `LLAMA_MOE_BANK_DET=1` and `GGML_MOE_CACHE_DET=1` in the environment.
+4. Send the same short prompt several times at temperature 0 and compare the token IDs. They differ between passes.
+5. Add `GGML_CUDA_QKV_SIDE=0`, or build `d63a678`: the passes are identical, and identical to a one-card run.
 
-## What's new in v0.6.3.3
+Limits of this claim: I saw the fault on this branch's multi-card path. I did not show it on untouched v0.6.4, because the multi-card path there is too slow to test. That the same fault exists there is read from the source. There is no regression test.
 
-- Small cards use memory-bounded prompt passes and shorter prompt-tail chunks by default. Normally free 24 GB cards keep their previous plan.
-- Fixes Windows private model mappings and MSVC atomics (#94, #93, #82). Linux launchers count physical performance cores on hybrid Intel CPUs.
-- Adds CPU expert-split diagnostics and `--moe-cpu-share` for troubleshooting (#88). [Release notes and hardware limits](docs/llamampere-v0.6.3.3/RELEASE_NOTES.md).
+## Results
 
-## What's new in v0.6.3.2
+Machine: Windows 11, Threadripper 9970X, 128 GB RAM, 3x RTX 3090 (24 GB), GPU clocks locked. Built with MSVC 14.50 and CUDA 13.3, `-DCMAKE_CUDA_ARCHITECTURES=86`. Model: the AI3 file with the MTP drafter, flags as in `scripts/flash-next-server.sh`. Prompt of about 86,000 tokens, 1,024 tokens written, 3 runs, server timings. Writing varies by several tokens/s from run to run.
 
-- Fixes a Flash-Next crash when a follow-up request reuses a cached prompt with shared experts on a side stream (#88).
-- Fixes Windows model loading, Windows build errors, and reads from large expert overlays (#82). [Release notes](docs/llamampere-v0.6.3.2/RELEASE_NOTES.md).
+| Setup | Writing tok/s | Prompt tok/s |
+|---|---|---|
+| v0.6.4 as shipped, 3 cards visible (1 run) | 0.7 | 213 |
+| v0.6.4, one card, upstream flags | 72.0 | 2,299 |
+| This branch, one card, upstream flags | 71.8 | 2,289 |
+| This branch, 3 cards, `--moe-skip off` | 103.5 | 2,143 |
+| This branch, 3 cards, `-ts 15,16,17`, `--moe-skip off` | 107.2 | 1,985 |
+| This branch, 2 cards, `--moe-skip off` | 97.9 | 1,345 |
+| This branch, 3 cards, AI4 file, `--moe-skip off` | 91.5 | 1,605 |
 
-## What's new in v0.6.3.1
+Notes on the table:
 
-- Flash-Next leaves more temporary card memory on 24 GB cards and handles `--parallel` startup. Unsupported Flash-Next tensor split now gives a clear error.
-- Small cards keep 32K prompt passes, with a 4096-token microbatch to avoid a measured prompt fallback. Adaptive prompt passes remain opt-in. [Release notes](docs/llamampere-v0.6.3.1/RELEASE_NOTES.md).
+- The multi-card rows run with `--moe-skip off` because skip is not supported on a split (see below). One card with `--moe-skip off` writes 65.1 tokens/s, so the like-for-like gain is 65.1 to 103.5.
+- A later repeat of the 3-card row measured 99.7 / 2,124.
+- Drafter off: 3 cards 66.9 / 2,314, 2 cards 68.7 / 1,592, AI4 on 3 cards 62.1 / 1,812 (measured on earlier commits of the branch).
+- With 3 cards all experts of AI3 sit on the cards. With 2 cards about 10.8 GiB of experts stay in host memory.
+- Load time 15 to 18 s. Card memory peaks in a 30-minute mixed run: 22.4 / 20.4 / 22.4 GiB.
 
-## What's new in v0.6.3
+## Correctness
 
-- **New Flash-Next model file, [qwen3.8-flash-next-Swift1.5-ATX-AI3](https://huggingface.co/jakeatx/qwen3.8-flash-next-Swift1.5-ATX-AI3):** 80.11 GB (74.61 GiB), compared with 75.97 GB for IQ3_XXS. On an RTX 3090 with ample system RAM, this file wrote 121–125 tokens/s across coding, agentic and RAG tasks. These are observations on the new file, not a same-engine comparison with the standard file. [Measured results and limits](docs/llamampere-v0.6.3/RELEASE_NOTES.md).
-- The expert kernels our speed tests use are now on by default; whole-file page read-ahead when the model fits in RAM.
+Checked with the repeatable settings listed above, at temperature 0, comparing token IDs and logprobs:
 
-## What's new in v0.6.1
+- One card, this branch against stock v0.6.4: identical on 5 prompts.
+- 3 cards against one card: identical on 5 prompts, including a 20,600-token and an 86,000-token prompt, drafter off and on. A 2,000-token answer is identical for all 2,000 tokens.
+- Context sizes 32768 and 65536: identical. A multi-turn chat: 11 of 11 turns identical.
+- 2 cards against one card: identical on short prompts.
+- AI4, 3 cards against one card: identical on short prompts.
+- 30-minute mixed run on 3 cards: 128 requests, 0 failures, writing speed flat.
 
-- **Faster Flash-Next:** about 3% faster writing and prompt reading than v0.6 on an RTX 3090 Ti (113.15 vs 109.65 writing tokens/s, 2,751 vs 2,672 prompt tokens/s, 100K prompt; one-seed observation), and room for more experts on the card. Fixes the 12 GB startup crash. [v0.6.1 release notes](docs/llamampere-v0.6.1/RELEASE_NOTES.md).
+When comparing long prompts, keep `LLAMA_B1` the same on both sides. It changes the numerics.
 
-## What's new in v0.6
+## Known issues and limits
 
-- **mb-MTP is on by default** with the MTP draft head: more guessed words are kept, so writing is faster (`--no-spec-mb-mtp` gives exact sampling).
-- **Faster prompt reading on Swift 1.5 27B** (+5.3% at 100K tokens) with the same output.
-- **AI+ model file for Swift 1.5 27B**, our own weight format for Ampere and newer cards: 14.4 GB, 10.4% lower KL (a measure of drift from the full-precision model) than IQ4_XS-M. Older AI+ files no longer load.
-- **Qwen3.8 Flash-Next** support: experts split between the card and RAM, with `--kv-gpu-tokens N` to keep only part of the context memory on the card.
+- **Based on v0.6.4.** A trial merge onto v0.7.0.1 conflicts in `ggml/src/ggml-cuda/moe-cache.cu` and `src/llama-context.cpp`. Not rebased, not tested on v0.7.
+- **Fixed cost per request on a split.** With 2 or 3 cards every request waits about 2.6 s before the first token, however small the prompt. After each prompt the engine re-plans the expert cache and rebuilds the per-card tables. One card does not do this for a small prompt (about 0.4 s). Workaround: `LLAMA_MOE_CACHE_RELEASE_PROMPT=0` (0.1 to 0.3 s). With it, short prompts are no longer token-identical to one card. I did not find out why one card skips the re-plan.
+- **Off on a split:** `--moe-skip`, expert swap, miss staging and the CPU split. Run with `--moe-skip off`.
+- **Two cards, long prompts:** the prompt chunk size follows free card memory, so long prompts do not repeat exactly from run to run. Pinning `-ub 2048` makes them repeat.
+- **AI4 on 3 cards:** a 20,600-token prompt differed between two passes, for the same reason.
+- **`-ts 15,16,17`:** faster writing, slower prompt reading than the default split. On an earlier commit a compute-buffer allocation failed at the start of a long prompt with an even split.
+- **Log lines seen on two cards:** at start `cudaMalloc failed ... retrying without pipeline parallelism` (the server then runs), and once `device expert prepare failed before a 2-row call ... it runs on host experts`. Not looked into.
+- **Not run:** Linux, the project's CI, `test-backend-ops`, `llama-bench`. Only this one machine and CUDA architecture 86.
+- **Tests:** `test-moe-cache` now builds on Windows. 14 of its 36 single-case options pass there; the same 22 fail on untouched v0.6.4 source. There is no new test for the layer split or for the bug fix.
 
-Details, speed tables and everything older: [v0.6 release notes](docs/llamampere-v0.6/RELEASE_NOTES.md).
+Not from this branch, but seen while testing: after a reply that the client sends back changed, the server re-reads thousands of tokens (about 7,800 in my test), because it can only go back to a checkpoint on the 8,192-token grid. Stock v0.6.4 on one card does the same. `LLAMA_SJKVARN_EXACT_CKPT=1` with `LLAMA_SJKVARN_EXACT_MAX_TOKENS=200000` removes it.
 
+## What the commits do
 
-## Quick start
+- `e45fbb5`, `80c3437`: experts go to the card that runs their layer; device tables per card.
+- `cdd8a7d`, `17ed920`, `ef72af7`, `343e126`: long-prompt speed on a split (experts copied on the device, full prompt chunks, large expert ops on the layer's own card, one kernel per resident tensor).
+- `d63a678`: the fix for the fault described above. History note: before the cause was found, the branch had a workaround commit (no graph replay on the card that runs the last layer). The fix removed it again, so I folded the two into this one commit before publishing. The source is the same as it was with both commits. The details of the search are available on request.
+- `0a59125`, `13263ae`, `3400b1b`: tight card memory (smaller prompt chunks, tensors that are only partly on a card).
+- `b87e733`: fixes "overlapping host registration rejected" errors when some experts stay in host memory.
+- `0ec7244`: a draft context never gets pipeline parallelism, so the drafter works on a split.
+- `ee009f5`: `test-moe-cache` builds on Windows.
 
-**Build and run (v0.6.4, Qwen3.8 Flash-Next, Linux).** For one RTX 30-series card with enough system RAM for the model and prompt workspace. Small-card tests used a 3090 limited to 12 GB with about 90 GiB of system RAM; native 12/16 GB cards remain unmeasured, and 64 GB of system RAM is not a fit promise. Small cards use memory-bounded prompt passes; see the [hardware limits](docs/llamampere-v0.6.3.5/RELEASE_NOTES.md). The launcher keeps the tested `--fit off` setting on a card with at least 8 GiB free (see the [v0.6.4 notes](docs/llamampere-v0.6.4/RELEASE_NOTES.md)); its own card planner still chooses the memory plan and keeps at least 5 GiB of RAM free. Automatic `--fit on` has not been measured on this file. Needs the CUDA 12 or newer toolkit (`nvcc`), CMake, git, a C++
-compiler, the `hf` download tool (`pip install -U huggingface_hub`) and 81.63 GB for the model and drafter, plus space for the build, prompt scratch and saved prompts. The launcher uses a 5 GiB free-RAM floor. This
-one paste clones or updates llamAmpere at v0.6.4, builds `llama-server`, downloads the model and its drafter and starts the server:
+## How to run it
 
-```bash
-if [ -d llamAmpere ]; then
-  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.6.4
-else
-  git clone -b v0.6.4 https://github.com/JakeATX/llamAmpere.git
-fi && cd llamAmpere && \
-cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_BORINGSSL=ON && \
-cmake --build build-sm86 -j8 --target llama-server && \
-hf download jakeatx/qwen3.8-flash-next-Swift1.5-ATX-AI3 --include '*.gguf' --local-dir models/flash-next && \
-hf download jakeatx/Swift-1.5-Qwen3.8-Flash-Next-MTP-Drafter-GGUF mtp-Swift-Qwen3.8-Flash-Next-GSQ-RCO-Q2S-B.gguf --local-dir models/flash-next && \
-LLAMA_SERVER_BIN=build-sm86/bin/llama-server \
-FLASH_NEXT_DRAFTER=models/flash-next/mtp-Swift-Qwen3.8-Flash-Next-GSQ-RCO-Q2S-B.gguf \
-scripts/flash-next-server.sh -m models/flash-next/qwen3.8-flash-next-Swift1.5-ATX-AI3-00001-of-00002.gguf
+Same flags as `scripts/flash-next-server.sh`, with all cards visible (or `--device CUDA1,CUDA2` for two) and `--moe-skip off` added at the end:
+
+```
+llama-server -m <AI3 first shard> -md <MTP drafter> --moe-profile data/moe/flash-next-experts.strp -ctk sjkvarn4 -ctv sjkvarn4 -ngl 999 -fa on -b 131072 -ub 8192 --fit off --moe-arena on --moe-cache on --ctx-checkpoints 4 -c 131072 -t 8 -tb 8 --parallel 1 --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 4 --moe-skip off
 ```
 
-To start it again later, run the last three lines from the `llamAmpere` folder. The server listens on http://127.0.0.1:8080 (OpenAI-compatible API).
+with the environment from `data/moe/flash-next.env` and `CUDA_DEVICE_ORDER=PCI_BUS_ID`.
 
-**Build and run (v0.6.4, Swift 1.5 27B at 2.3 bpw, 200K context, one 24 GB RTX 30-series card, Linux).** Needs the CUDA 12 or newer
-toolkit (`nvcc`), CMake, git and a C++ compiler. The model (about 9.1 GB) downloads on first start. This one paste clones or
-updates llamAmpere at v0.6.4, builds `llama-server` and starts it:
+---
 
-```bash
-if [ -d llamAmpere ]; then
-  git -C llamAmpere fetch --tags --force && git -C llamAmpere checkout v0.6.4
-else
-  git clone -b v0.6.4 https://github.com/JakeATX/llamAmpere.git
-fi && cd llamAmpere && \
-cmake -S . -B build-sm86 -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 -DLLAMA_BUILD_BORINGSSL=ON && \
-cmake --build build-sm86 -j8 --target llama-server && \
-./build-sm86/bin/llama-server -hf jakeatx/qwen3.8-27b-Swift1.5-Uncensored-ATX-AI2 \
-  -c 204800 -ngl 99 -fa on -b 4096 -ub 1024 --parallel 1 --jinja --no-context-shift \
-  -ctk sjkvarn3 -ctv sjkvarn2 --sjkvarn-body-type auto \
-  --spec-type draft-mtp-adaptive --spec-draft-n-min-adaptive 3 --spec-draft-n-max 4 \
-  --spec-draft-p-min 0 --spec-mb-mtp
-```
-
-Commands for 12 and 10 GB cards (not yet run on this model) are in the [v0.6.2 release notes](https://github.com/JakeATX/llamAmpere/releases/tag/v0.6.2).
-
-The server listens on http://127.0.0.1:8080 (OpenAI-compatible API). Add `--no-spec-mb-mtp` for exact drafting.
-To use the IQ4_XS-M file (15.6 GB, also runs in mainline llama.cpp) instead, use
-`--hf-repo jakeatx/ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M-GGUF --hf-file ATX-Swift-1.5-Qwen3.8-27B-Uncensored-IQ4_XS-M.gguf`.
-
-## Headline results
-
-Numbers for this release (Swift 1.5 27B, v0.6 against v0.5) are in the [v0.6 release notes](docs/llamampere-v0.6/RELEASE_NOTES.md).
-
-## Links
-
-- Release notes: [v0.6.4](docs/llamampere-v0.6.4/RELEASE_NOTES.md), [v0.6.3.11](docs/llamampere-v0.6.3.11/RELEASE_NOTES.md), [v0.6.3.10](docs/llamampere-v0.6.3.10/RELEASE_NOTES.md), [v0.6.3.9](docs/llamampere-v0.6.3.9/RELEASE_NOTES.md), [v0.6.3.8](docs/llamampere-v0.6.3.8/RELEASE_NOTES.md), [v0.6.3.6](docs/llamampere-v0.6.3.6/RELEASE_NOTES.md), [v0.6.3.5](docs/llamampere-v0.6.3.5/RELEASE_NOTES.md), [v0.6.3.3](docs/llamampere-v0.6.3.3/RELEASE_NOTES.md), [v0.6.3.2](docs/llamampere-v0.6.3.2/RELEASE_NOTES.md), [v0.6.3.1](docs/llamampere-v0.6.3.1/RELEASE_NOTES.md), [v0.6.3](docs/llamampere-v0.6.3/RELEASE_NOTES.md), [v0.6.2](docs/llamampere-v0.6.2/RELEASE_NOTES.md), [v0.6.1](docs/llamampere-v0.6.1/RELEASE_NOTES.md), [v0.6](docs/llamampere-v0.6/RELEASE_NOTES.md), [v0.5](docs/llamampere-v0.5/RELEASE_NOTES.md), [v0.4](docs/llamampere-v0.4/RELEASE_NOTES.md), [v0.3.1](docs/llamampere-v0.3.1/RELEASE_NOTES.md); recommended settings for each card size: [v0.5 RECOMMENDED.md](docs/llamampere-v0.5/RECOMMENDED.md)
-- Models: [huggingface.co/jakeatx](https://huggingface.co/jakeatx), [Qwen3.8 Flash-Next collection](https://huggingface.co/collections/jakeatx/qwen38-flash-next-6ae148b9e743c8905b00c70d)
-- Background: [QWEN_AMPERE.md](QWEN_AMPERE.md), [write-up](docs/llamampere-v0.3/ARTICLE.md), flags in [docs/speculative.md](docs/speculative.md) and [docs/KV-cache-quantization.md](docs/KV-cache-quantization.md)
-- SJ-KVaRN paper: [paper](https://huggingface.co/spaces/jakeatx/sj-kvarn-paper), codec [JakeATX/sj-kvarn-codec](https://github.com/JakeATX/sj-kvarn-codec) (MIT)
-- Upstream llama.cpp README (quick start, backends, docs index): [docs/llama.cpp-upstream-README.md](docs/llama.cpp-upstream-README.md)
-
-## License and credits
-
-llamAmpere is MIT licensed (see [LICENSE](LICENSE)). It is a fork of [llama.cpp](https://github.com/ggml-org/llama.cpp)
-by the ggml authors and includes work from TheTom's TurboQuant fork. It is the successor of
-[llama-cpp-qwen-ampere](https://github.com/JakeATX/llama-cpp-qwen-ampere). Contributing: [CONTRIBUTING.md](CONTRIBUTING.md).
-
-Third-party libraries (from upstream llama.cpp):
-
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+Drafted with Claude Code (Claude Fable 5.2). Measurements were made on my machine between 2026-11-15 and 2026-11-18.
